@@ -21,6 +21,7 @@ def main():
                                             args.device,
                                             args.mode,
                                             args.content_metric,
+                                            '/app/AIGC/Models/art_fid/art_inception.pth',
                                             args.num_workers)
 
     print('ArtFID value:', art_fid_value)

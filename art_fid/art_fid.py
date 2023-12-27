@@ -13,7 +13,6 @@ from . import utils
 from . import inception
 from . import image_metrics
 
-
 ALLOWED_IMAGE_EXTENSIONS = ['jpg', 'JPG', 'jpeg', 'JPEG', 'png', 'PNG']
 CKPT_URL = 'https://huggingface.co/matthias-wright/art_inception/resolve/main/art_inception.pth'
 
@@ -28,7 +27,14 @@ class ImagePathDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, i):
         path = self.files[i]
-        img = Image.open(path).convert('RGB')
+        if isinstance(path, str) and os.path.isfile(path):
+            img = Image.open(path).convert('RGB')
+        elif isinstance(path, np.ndarray):
+            img = Image.fromarray(path)
+        elif isinstance(path, Image.Image):
+            img = path
+        else:
+            raise ValueError(f'Unsupported image file type or is not a image file path! {type(Image)} from {path}')
         if self.transforms is not None:
             img = self.transforms(img)
         return img
@@ -161,6 +167,10 @@ def get_image_paths(path, sort=False):
         (list): List of image paths with allowed file extensions.
 
     """
+    if isinstance(path, list):
+        assert isinstance(path[0], (np.ndarray, Image.Image)), f'Unsupported type of image path {type(path[0])} of {path[0]}'
+        return path
+
     paths = []
     for extension in ALLOWED_IMAGE_EXTENSIONS:
         paths.extend(glob.glob(os.path.join(path, f'*.{extension}')))
@@ -169,7 +179,7 @@ def get_image_paths(path, sort=False):
     return paths
 
 
-def compute_fid(path_to_stylized, path_to_style, batch_size, device, num_workers=1):
+def compute_fid(path_to_stylized, path_to_style, batch_size, device, inception_ckpt_file=None, num_workers=1):
     """Computes the FID for the given paths.
 
     Args:
@@ -184,24 +194,28 @@ def compute_fid(path_to_stylized, path_to_style, batch_size, device, num_workers
     """
     device = torch.device('cuda') if device == 'cuda' and torch.cuda.is_available() else torch.device('cpu')
 
-    ckpt_file = utils.download(CKPT_URL)
+    if inception_ckpt_file is not None and os.path.isfile(inception_ckpt_file):
+        ckpt_file = inception_ckpt_file
+    else:
+        ckpt_file = utils.download(CKPT_URL)
     ckpt = torch.load(ckpt_file, map_location=device)
-    
+
     model = inception.Inception3().to(device)
     model.load_state_dict(ckpt, strict=False)
     model.eval()
-    
+
     stylized_image_paths = get_image_paths(path_to_stylized)
     style_image_paths = get_image_paths(path_to_style)
 
     mu1, sigma1 = compute_activation_statistics(stylized_image_paths, model, batch_size, device, num_workers)
     mu2, sigma2 = compute_activation_statistics(style_image_paths, model, batch_size, device, num_workers)
-    
+
     fid_value = compute_frechet_distance(mu1, sigma1, mu2, sigma2)
     return fid_value
 
 
-def compute_fid_infinity(path_to_stylized, path_to_style, batch_size, device, num_points=15, num_workers=1):
+def compute_fid_infinity(path_to_stylized, path_to_style, batch_size, device, num_points=15, inception_ckpt_file=None,
+                         num_workers=1):
     """Computes the FID infinity for the given paths.
 
     Args:
@@ -216,10 +230,12 @@ def compute_fid_infinity(path_to_stylized, path_to_style, batch_size, device, nu
         (float) FID infinity value.
     """
     device = torch.device('cuda') if device == 'cuda' and torch.cuda.is_available() else torch.device('cpu')
-
-    ckpt_file = utils.download(CKPT_URL)
+    if inception_ckpt_file is not None and os.path.isfile(inception_ckpt_file):
+        ckpt_file = inception_ckpt_file
+    else:
+        ckpt_file = utils.download(CKPT_URL)
     ckpt = torch.load(ckpt_file, map_location=device)
-    
+
     model = inception.Inception3().to(device)
     model.load_state_dict(ckpt, strict=False)
     model.eval()
@@ -228,32 +244,32 @@ def compute_fid_infinity(path_to_stylized, path_to_style, batch_size, device, nu
     style_image_paths = get_image_paths(path_to_style)
 
     assert len(stylized_image_paths) == len(style_image_paths), \
-           'Number of stylized images and number of style images must be equal.'
+        'Number of stylized images and number of style images must be equal.'
 
     activations_stylized = get_activations(stylized_image_paths, model, batch_size, device, num_workers)
     activations_style = get_activations(style_image_paths, model, batch_size, device, num_workers)
     activation_idcs = np.arange(activations_stylized.shape[0])
 
     fids = []
-    
+
     fid_batches = np.linspace(start=5000, stop=len(stylized_image_paths), num=num_points).astype('int32')
-    
+
     for fid_batch_size in fid_batches:
         np.random.shuffle(activation_idcs)
         idcs = activation_idcs[:fid_batch_size]
-        
+
         act_style_batch = activations_style[idcs]
         act_stylized_batch = activations_stylized[idcs]
 
         mu_style, sigma_style = np.mean(act_style_batch, axis=0), np.cov(act_style_batch, rowvar=False)
         mu_stylized, sigma_stylized = np.mean(act_stylized_batch, axis=0), np.cov(act_stylized_batch, rowvar=False)
-        
+
         fid_value = compute_frechet_distance(mu_style, sigma_style, mu_stylized, sigma_stylized)
         fids.append(fid_value)
 
     fids = np.array(fids).reshape(-1, 1)
     reg = LinearRegression().fit(1 / fid_batches.reshape(-1, 1), fids)
-    fid_infinity = reg.predict(np.array([[0]]))[0,0]
+    fid_infinity = reg.predict(np.array([[0]]))[0, 0]
 
     return fid_infinity
 
@@ -279,17 +295,17 @@ def compute_content_distance(path_to_stylized, path_to_content, batch_size, cont
     content_image_paths = get_image_paths(path_to_content, sort=True)
 
     assert len(stylized_image_paths) == len(content_image_paths), \
-           'Number of stylized images and number of content images must be equal.'
+        'Number of stylized images and number of content images must be equal.'
 
     if content_metric == 'clip':
         content_transforms = Compose([Resize(224, interpolation=InterpolationMode.BICUBIC),
                                       CenterCrop(224),
-                                      lambda img : img.convert('RGB'),
+                                      lambda img: img.convert('RGB'),
                                       ToTensor(),
                                       Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))])
     else:
         content_transforms = ToTensor()
-    
+
     dataset_stylized = ImagePathDataset(stylized_image_paths, transforms=content_transforms)
     dataloader_stylized = torch.utils.data.DataLoader(dataset_stylized,
                                                       batch_size=batch_size,
@@ -303,7 +319,7 @@ def compute_content_distance(path_to_stylized, path_to_content, batch_size, cont
                                                      shuffle=False,
                                                      drop_last=False,
                                                      num_workers=num_workers)
-    
+
     if content_metric == 'vgg' or content_metric == 'alexnet':
         metric = image_metrics.Metric(content_metric).to(device)
     elif content_metric == 'lpips':
@@ -327,7 +343,8 @@ def compute_content_distance(path_to_stylized, path_to_content, batch_size, cont
     return dist_sum / N
 
 
-def compute_art_fid(path_to_stylized, path_to_style, path_to_content, batch_size, device, mode='art_fid_inf', content_metric='lpips', num_workers=1):
+def compute_art_fid(path_to_stylized, path_to_style, path_to_content, batch_size, device, mode='art_fid_inf',
+                    content_metric='lpips', inception_ckpt_file=None, num_workers=1):
     """Computes the FID for the given paths.
 
     Args:
@@ -346,11 +363,10 @@ def compute_art_fid(path_to_stylized, path_to_style, path_to_content, batch_size
     if mode == 'art_fid_inf':
         fid_value = compute_fid_infinity(path_to_stylized, path_to_style, batch_size, device, num_workers)
     else:
-        fid_value = compute_fid(path_to_stylized, path_to_style, batch_size, device, num_workers)
-    
+        fid_value = compute_fid(path_to_stylized, path_to_style, batch_size, device, inception_ckpt_file, num_workers)
+
     print('Compute content distance...')
     content_dist = compute_content_distance(path_to_stylized, path_to_content, batch_size, content_metric, device, num_workers)
 
     art_fid_value = (content_dist + 1) * (fid_value + 1)
     return art_fid_value.item()
-
